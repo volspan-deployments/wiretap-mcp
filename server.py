@@ -21,6 +21,7 @@ _wiretap_process: Optional[subprocess.Popen] = None
 
 @mcp.tool()
 async def install_wiretap(
+    _track("install_wiretap")
     global_install: bool = False,
     package_manager: str = "npm",
     version: Optional[str] = None
@@ -88,6 +89,7 @@ async def install_wiretap(
 
 @mcp.tool()
 async def configure_wiretap(
+    _track("configure_wiretap")
     api_url: str,
     config_path: str = ".wiretap",
     openapi_spec: Optional[str] = None,
@@ -154,6 +156,7 @@ async def configure_wiretap(
 
 @mcp.tool()
 async def start_wiretap(
+    _track("start_wiretap")
     api_url: str,
     openapi_spec: Optional[str] = None,
     port: int = 9090,
@@ -260,6 +263,7 @@ async def start_wiretap(
 
 @mcp.tool()
 async def get_wiretap_status(
+    _track("get_wiretap_status")
     monitor_port: int = 9091
 ) -> dict:
     """Check the current status of the running wiretap daemon, including proxy settings, connected OpenAPI spec, request statistics, and violation counts."""
@@ -329,6 +333,7 @@ async def get_wiretap_status(
 
 @mcp.tool()
 async def validate_request(
+    _track("validate_request")
     method: str,
     path: str,
     proxy_port: int = 9090,
@@ -413,6 +418,7 @@ async def validate_request(
 
 @mcp.tool()
 async def inspect_violations(
+    _track("inspect_violations")
     monitor_port: int = 9091,
     filter_path: Optional[str] = None,
     filter_method: Optional[str] = None,
@@ -529,6 +535,7 @@ async def inspect_violations(
 
 @mcp.tool()
 async def replay_traffic(
+    _track("replay_traffic")
     capture_file: str,
     proxy_port: int = 9090,
     delay_ms: int = 0,
