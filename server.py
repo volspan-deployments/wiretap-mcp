@@ -6,572 +6,685 @@ import threading
 from fastmcp import FastMCP
 import httpx
 import os
+import json
+import asyncio
 import subprocess
 import sys
-import json
-import shutil
-import yaml
 from typing import Optional, List
+import yaml
 
 mcp = FastMCP("wiretap")
 
 # Track running wiretap processes
-_wiretap_processes = {}
+_wiretap_process: Optional[subprocess.Popen] = None
 
 
-def _find_wiretap_binary() -> Optional[str]:
-    """Find the wiretap binary in PATH or common locations."""
-    # Try to find wiretap in PATH
-    binary = shutil.which("wiretap")
-    if binary:
-        return binary
-    # Try npx
-    npx = shutil.which("npx")
-    if npx:
-        return None  # Will use npx
-    return None
+@mcp.tool()
+async def install_wiretap(
+    global_install: bool = False,
+    package_manager: str = "npm",
+    version: Optional[str] = None
+) -> dict:
+    """Install the wiretap binary for the current platform using npm/npx. Use this to set up wiretap in a JavaScript/TypeScript project environment before using other tools."""
+    try:
+        package_name = "@pb33f/wiretap"
+        if version:
+            package_name = f"@pb33f/wiretap@{version}"
+
+        if package_manager == "npx":
+            cmd = ["npx", package_name, "--version"]
+        elif package_manager == "yarn":
+            if global_install:
+                cmd = ["yarn", "global", "add", package_name]
+            else:
+                cmd = ["yarn", "add", package_name]
+        else:
+            # npm
+            if global_install:
+                cmd = ["npm", "install", "-g", package_name]
+            else:
+                cmd = ["npm", "install", package_name]
+
+        result = await asyncio.get_event_loop().run_in_executor(
+            None,
+            lambda: subprocess.run(
+                cmd,
+                capture_output=True,
+                text=True,
+                timeout=120
+            )
+        )
+
+        success = result.returncode == 0
+        return {
+            "success": success,
+            "command": " ".join(cmd),
+            "stdout": result.stdout.strip(),
+            "stderr": result.stderr.strip(),
+            "returncode": result.returncode,
+            "message": "wiretap installed successfully" if success else "Installation failed",
+            "package_manager": package_manager,
+            "global": global_install,
+            "version": version or "latest"
+        }
+    except subprocess.TimeoutExpired:
+        return {
+            "success": False,
+            "error": "Installation timed out after 120 seconds",
+            "command": " ".join(cmd)
+        }
+    except FileNotFoundError as e:
+        return {
+            "success": False,
+            "error": f"Package manager '{package_manager}' not found: {str(e)}",
+            "suggestion": f"Make sure {package_manager} is installed and available in PATH"
+        }
+    except Exception as e:
+        return {
+            "success": False,
+            "error": str(e)
+        }
 
 
-def _build_wiretap_command(args: list) -> list:
-    """Build a wiretap command using available binary."""
-    binary = _find_wiretap_binary()
-    if binary:
-        return [binary] + args
-    # Fall back to npx
-    npx = shutil.which("npx")
-    if npx:
-        return [npx, "@pb33f/wiretap"] + args
-    return ["wiretap"] + args  # Hope it's in PATH
+@mcp.tool()
+async def configure_wiretap(
+    api_url: str,
+    config_path: str = ".wiretap",
+    openapi_spec: Optional[str] = None,
+    path_rewrites: Optional[List[dict]] = None,
+    ignored_paths: Optional[List[str]] = None,
+    hard_errors: bool = False,
+    strip_prefixes: Optional[List[str]] = None
+) -> dict:
+    """Create or update a wiretap configuration file with proxy rules, path rewrites, ignored paths, and other settings."""
+    try:
+        config = {
+            "contract": openapi_spec,
+            "redirectHost": api_url,
+            "hardErrors": hard_errors,
+        }
+
+        # Parse the api_url to extract components
+        try:
+            parsed = httpx.URL(api_url)
+            config["redirectHost"] = parsed.host
+            config["redirectPort"] = str(parsed.port) if parsed.port else ("443" if parsed.scheme == "https" else "80")
+            config["redirectBasePath"] = str(parsed.raw_path.decode()) if parsed.raw_path else ""
+            config["redirectProtocol"] = parsed.scheme
+        except Exception:
+            config["redirectHost"] = api_url
+
+        if openapi_spec:
+            config["contract"] = openapi_spec
+        else:
+            config.pop("contract", None)
+
+        if path_rewrites:
+            config["pathRewrites"] = path_rewrites
+
+        if ignored_paths:
+            config["ignoredPaths"] = ignored_paths
+
+        if strip_prefixes:
+            config["stripPrefixes"] = strip_prefixes
+
+        # Remove None values
+        config = {k: v for k, v in config.items() if v is not None}
+
+        # Write as YAML
+        config_content = yaml.dump(config, default_flow_style=False, allow_unicode=True)
+
+        with open(config_path, "w") as f:
+            f.write(config_content)
+
+        return {
+            "success": True,
+            "config_path": config_path,
+            "config": config,
+            "config_content": config_content,
+            "message": f"Configuration written to {config_path}"
+        }
+    except Exception as e:
+        return {
+            "success": False,
+            "error": str(e),
+            "config_path": config_path
+        }
 
 
 @mcp.tool()
 async def start_wiretap(
-    url: str,
-    spec: Optional[str] = None,
+    api_url: str,
+    openapi_spec: Optional[str] = None,
     port: int = 9090,
     monitor_port: int = 9091,
-    config: Optional[str] = None,
-    hard_errors: bool = False
+    config_file: Optional[str] = None
 ) -> dict:
-    """Start the wiretap proxy daemon to intercept and validate API traffic against an OpenAPI specification.
-    Wiretap acts as a transparent proxy between a client and a target API."""
+    """Start the wiretap proxy daemon to intercept and validate API traffic against an OpenAPI spec."""
+    global _wiretap_process
+
     try:
-        args = ["-u", url, "-p", str(port), "-m", str(monitor_port)]
+        # Check if already running
+        if _wiretap_process is not None and _wiretap_process.poll() is None:
+            return {
+                "success": False,
+                "error": "Wiretap process is already running",
+                "pid": _wiretap_process.pid,
+                "suggestion": "Stop the existing process first or use get_wiretap_status to check its status"
+            }
 
-        if spec:
-            args.extend(["-s", spec])
-        if config:
-            args.extend(["-c", config])
-        if hard_errors:
-            args.append("--hard-errors")
+        # Build command
+        # Try to find wiretap binary
+        wiretap_cmd = "wiretap"
 
-        cmd = _build_wiretap_command(args)
+        # Check common locations
+        possible_paths = [
+            "wiretap",
+            "./node_modules/.bin/wiretap",
+            "/usr/local/bin/wiretap",
+        ]
 
+        cmd = None
+        for path in possible_paths:
+            try:
+                check = subprocess.run([path, "--version"], capture_output=True, timeout=5)
+                wiretap_cmd = path
+                break
+            except (FileNotFoundError, subprocess.TimeoutExpired):
+                continue
+
+        args = [wiretap_cmd, "-u", api_url]
+
+        if openapi_spec:
+            args.extend(["-s", openapi_spec])
+
+        if port != 9090:
+            args.extend(["-p", str(port)])
+
+        if monitor_port != 9091:
+            args.extend(["-m", str(monitor_port)])
+
+        if config_file:
+            args.extend(["-c", config_file])
+
+        # Start the process
         process = subprocess.Popen(
-            cmd,
+            args,
             stdout=subprocess.PIPE,
             stderr=subprocess.PIPE,
             text=True
         )
 
-        # Store process reference
-        _wiretap_processes[port] = process
+        _wiretap_process = process
 
-        # Wait briefly to check if it started successfully
-        import time
-        time.sleep(1)
+        # Wait a moment to see if it starts successfully
+        await asyncio.sleep(2)
 
         if process.poll() is not None:
             stdout, stderr = process.communicate()
             return {
                 "success": False,
-                "error": f"Wiretap failed to start. Exit code: {process.returncode}",
-                "stdout": stdout,
-                "stderr": stderr,
-                "command": " ".join(cmd)
+                "error": "Wiretap process exited immediately",
+                "stdout": stdout.strip(),
+                "stderr": stderr.strip(),
+                "returncode": process.returncode,
+                "command": " ".join(args)
             }
 
         return {
             "success": True,
-            "message": f"Wiretap proxy started successfully",
             "pid": process.pid,
+            "command": " ".join(args),
+            "api_url": api_url,
+            "proxy_port": port,
+            "monitor_port": monitor_port,
+            "openapi_spec": openapi_spec,
+            "config_file": config_file,
             "proxy_url": f"http://localhost:{port}",
             "monitor_url": f"http://localhost:{monitor_port}",
-            "target_url": url,
-            "spec": spec,
-            "hard_errors": hard_errors,
-            "command": " ".join(cmd),
-            "note": "Direct requests through http://localhost:{} to proxy to {}".format(port, url)
+            "message": f"Wiretap started successfully. Proxy at http://localhost:{port}, Monitor at http://localhost:{monitor_port}"
         }
     except FileNotFoundError:
         return {
             "success": False,
-            "error": "Wiretap binary not found. Install with: npm install -g @pb33f/wiretap or brew install pb33f/taps/wiretap",
-            "install_options": [
-                "npm install -g @pb33f/wiretap",
-                "yarn global add @pb33f/wiretap",
-                "brew install pb33f/taps/wiretap",
-                "curl -fsSL https://pb33f.io/wiretap/install.sh | sh"
-            ]
+            "error": "wiretap binary not found",
+            "suggestion": "Install wiretap first using install_wiretap tool or 'npm install -g @pb33f/wiretap'",
+            "command": " ".join(args) if 'args' in locals() else "wiretap ..."
         }
     except Exception as e:
-        return {"success": False, "error": str(e)}
+        return {
+            "success": False,
+            "error": str(e)
+        }
+
+
+@mcp.tool()
+async def get_wiretap_status(
+    monitor_port: int = 9091
+) -> dict:
+    """Check the current status of the running wiretap daemon, including proxy settings, connected OpenAPI spec, request statistics, and violation counts."""
+    global _wiretap_process
+
+    status = {
+        "daemon_running": False,
+        "pid": None,
+        "monitor_port": monitor_port,
+        "monitor_url": f"http://localhost:{monitor_port}"
+    }
+
+    # Check process status
+    if _wiretap_process is not None:
+        poll = _wiretap_process.poll()
+        if poll is None:
+            status["daemon_running"] = True
+            status["pid"] = _wiretap_process.pid
+        else:
+            status["daemon_running"] = False
+            status["exit_code"] = poll
+
+    # Try to query the monitor API
+    try:
+        async with httpx.AsyncClient(timeout=5.0) as client:
+            # Try common wiretap monitor endpoints
+            endpoints_tried = []
+
+            # Try the transactions/statistics endpoint
+            try:
+                resp = await client.get(f"http://localhost:{monitor_port}/api/wiretap/statistics")
+                if resp.status_code == 200:
+                    status["monitor_accessible"] = True
+                    status["statistics"] = resp.json()
+                    status["daemon_running"] = True
+                    endpoints_tried.append({"url": f"http://localhost:{monitor_port}/api/wiretap/statistics", "status": resp.status_code})
+            except Exception as e:
+                endpoints_tried.append({"url": f"http://localhost:{monitor_port}/api/wiretap/statistics", "error": str(e)})
+
+            # Try the transactions endpoint
+            try:
+                resp = await client.get(f"http://localhost:{monitor_port}/api/wiretap/transactions")
+                if resp.status_code == 200:
+                    data = resp.json()
+                    status["monitor_accessible"] = True
+                    status["daemon_running"] = True
+                    if isinstance(data, list):
+                        status["total_transactions"] = len(data)
+                    elif isinstance(data, dict):
+                        status["transactions"] = data
+                    endpoints_tried.append({"url": f"http://localhost:{monitor_port}/api/wiretap/transactions", "status": resp.status_code})
+            except Exception as e:
+                endpoints_tried.append({"url": f"http://localhost:{monitor_port}/api/wiretap/transactions", "error": str(e)})
+
+            status["endpoints_tried"] = endpoints_tried
+
+            if not status.get("monitor_accessible"):
+                status["monitor_accessible"] = False
+                status["monitor_message"] = "Could not connect to wiretap monitor API. Wiretap may not be running."
+
+    except Exception as e:
+        status["monitor_accessible"] = False
+        status["monitor_error"] = str(e)
+
+    return status
 
 
 @mcp.tool()
 async def validate_request(
-    spec: str,
     method: str,
     path: str,
+    proxy_port: int = 9090,
     headers: Optional[List[str]] = None,
     body: Optional[str] = None,
-    query: Optional[str] = None
+    query_params: Optional[str] = None
 ) -> dict:
-    """Validate a specific HTTP request against an OpenAPI specification without proxying live traffic.
-    Checks if the given request (method, path, headers, body) complies with the API contract."""
+    """Send a test HTTP request through the wiretap proxy to validate it against the OpenAPI spec."""
     try:
-        # Build the validate request command
-        args = ["validate", "request", "-s", spec, "-m", method.upper(), "-p", path]
+        method = method.upper()
+        url = f"http://localhost:{proxy_port}{path}"
+        if query_params:
+            url = f"{url}?{query_params}"
 
+        # Parse headers
+        parsed_headers = {}
         if headers:
             for header in headers:
-                args.extend(["-H", header])
-        if body:
-            args.extend(["-d", body])
-        if query:
-            full_path = f"{path}?{query}"
-            # Replace the path argument
-            p_index = args.index("-p") + 1
-            args[p_index] = full_path
+                if ":" in header:
+                    key, _, value = header.partition(":")
+                    parsed_headers[key.strip()] = value.strip()
 
-        cmd = _build_wiretap_command(args)
+        # Default content-type for body requests
+        if body and "Content-Type" not in parsed_headers:
+            parsed_headers["Content-Type"] = "application/json"
 
-        result = subprocess.run(
-            cmd,
-            capture_output=True,
-            text=True,
-            timeout=30
-        )
+        async with httpx.AsyncClient(timeout=30.0) as client:
+            request_kwargs = {
+                "method": method,
+                "url": url,
+                "headers": parsed_headers
+            }
 
-        # Parse output
-        output = result.stdout + result.stderr
-        violations = []
-        lines = output.strip().split("\n") if output.strip() else []
+            if body:
+                request_kwargs["content"] = body.encode("utf-8")
 
-        for line in lines:
-            if line.strip():
-                violations.append(line.strip())
+            response = await client.request(**request_kwargs)
 
-        is_valid = result.returncode == 0
+            # Try to parse response body
+            response_body = None
+            try:
+                response_body = response.json()
+            except Exception:
+                response_body = response.text
 
-        return {
-            "success": True,
-            "valid": is_valid,
-            "method": method.upper(),
-            "path": path,
-            "spec": spec,
-            "violations": violations,
-            "violation_count": len([v for v in violations if v]),
-            "raw_output": output,
-            "exit_code": result.returncode,
-            "command": " ".join(cmd)
-        }
-    except subprocess.TimeoutExpired:
-        return {"success": False, "error": "Validation timed out after 30 seconds"}
-    except FileNotFoundError:
-        return {
-            "success": False,
-            "error": "Wiretap binary not found. Install with: npm install -g @pb33f/wiretap"
-        }
-    except Exception as e:
-        return {"success": False, "error": str(e)}
+            # Check for wiretap violation headers
+            violation_headers = {
+                k: v for k, v in response.headers.items()
+                if "wiretap" in k.lower() or "violation" in k.lower()
+            }
 
-
-@mcp.tool()
-async def validate_response(
-    spec: str,
-    method: str,
-    path: str,
-    status_code: int,
-    headers: Optional[List[str]] = None,
-    body: Optional[str] = None
-) -> dict:
-    """Validate a specific HTTP response against an OpenAPI specification.
-    Checks if an API response (status code, headers, body) complies with the contract."""
-    try:
-        args = ["validate", "response", "-s", spec, "-m", method.upper(), "-p", path, "-c", str(status_code)]
-
-        if headers:
-            for header in headers:
-                args.extend(["-H", header])
-        if body:
-            args.extend(["-d", body])
-
-        cmd = _build_wiretap_command(args)
-
-        result = subprocess.run(
-            cmd,
-            capture_output=True,
-            text=True,
-            timeout=30
-        )
-
-        output = result.stdout + result.stderr
-        violations = []
-        lines = output.strip().split("\n") if output.strip() else []
-
-        for line in lines:
-            if line.strip():
-                violations.append(line.strip())
-
-        is_valid = result.returncode == 0
-
-        return {
-            "success": True,
-            "valid": is_valid,
-            "method": method.upper(),
-            "path": path,
-            "status_code": status_code,
-            "spec": spec,
-            "violations": violations,
-            "violation_count": len([v for v in violations if v]),
-            "raw_output": output,
-            "exit_code": result.returncode,
-            "command": " ".join(cmd)
-        }
-    except subprocess.TimeoutExpired:
-        return {"success": False, "error": "Validation timed out after 30 seconds"}
-    except FileNotFoundError:
+            return {
+                "success": True,
+                "method": method,
+                "url": url,
+                "proxy_port": proxy_port,
+                "status_code": response.status_code,
+                "response_headers": dict(response.headers),
+                "response_body": response_body,
+                "violation_headers": violation_headers,
+                "request_headers_sent": parsed_headers,
+                "request_body": body,
+                "has_violations": len(violation_headers) > 0,
+                "message": f"Request sent through wiretap proxy at http://localhost:{proxy_port}"
+            }
+    except httpx.ConnectError:
         return {
             "success": False,
-            "error": "Wiretap binary not found. Install with: npm install -g @pb33f/wiretap"
+            "error": f"Could not connect to wiretap proxy at http://localhost:{proxy_port}",
+            "suggestion": "Make sure wiretap is running. Use start_wiretap to start it.",
+            "method": method,
+            "url": f"http://localhost:{proxy_port}{path}"
         }
     except Exception as e:
-        return {"success": False, "error": str(e)}
-
-
-@mcp.tool()
-async def configure_path_rewrite(
-    config_file: str,
-    source_path: str,
-    target_path: str,
-    rewrite_id: Optional[str] = None,
-    target_host: Optional[str] = None
-) -> dict:
-    """Configure path rewriting rules in the wiretap configuration to redirect or rewrite
-    incoming request paths before they are forwarded to the upstream API."""
-    try:
-        # Load existing config or create new one
-        existing_config = {}
-        try:
-            with open(config_file, 'r') as f:
-                existing_config = yaml.safe_load(f) or {}
-        except FileNotFoundError:
-            existing_config = {}
-        except Exception as e:
-            return {"success": False, "error": f"Failed to read config file: {str(e)}"}
-
-        # Build the rewrite rule entry
-        rewrite_rule = {
-            "pathPattern": source_path,
-            "rewritePath": target_path
-        }
-
-        if rewrite_id:
-            rewrite_rule["rewriteId"] = rewrite_id
-        if target_host:
-            rewrite_rule["target"] = target_host
-
-        # Add to paths configuration
-        if "paths" not in existing_config:
-            existing_config["paths"] = []
-
-        # Check if rule already exists and update, or append
-        paths = existing_config["paths"]
-        found = False
-        for i, p in enumerate(paths):
-            if isinstance(p, dict) and p.get("pathPattern") == source_path:
-                paths[i] = rewrite_rule
-                found = True
-                break
-
-        if not found:
-            paths.append(rewrite_rule)
-
-        existing_config["paths"] = paths
-
-        # Write updated config
-        with open(config_file, 'w') as f:
-            yaml.dump(existing_config, f, default_flow_style=False, sort_keys=False)
-
         return {
-            "success": True,
-            "message": f"Path rewrite rule {'updated' if found else 'added'} successfully",
-            "config_file": config_file,
-            "rule": rewrite_rule,
-            "total_rules": len(existing_config["paths"]),
-            "config_preview": yaml.dump(existing_config, default_flow_style=False)
+            "success": False,
+            "error": str(e),
+            "method": method,
+            "path": path
         }
-    except Exception as e:
-        return {"success": False, "error": str(e)}
 
 
 @mcp.tool()
-async def get_violations(
-    monitor_url: str = "http://localhost:9091",
+async def inspect_violations(
+    monitor_port: int = 9091,
     filter_path: Optional[str] = None,
-    violation_type: Optional[str] = None,
+    filter_method: Optional[str] = None,
     limit: int = 50
 ) -> dict:
-    """Retrieve captured OpenAPI contract violations from the wiretap proxy session.
-    Returns all detected compliance issues between requests/responses and the API spec."""
+    """Retrieve and display OpenAPI contract violations captured by the running wiretap daemon."""
     try:
         async with httpx.AsyncClient(timeout=10.0) as client:
-            # Try common wiretap monitor API endpoints
+            violations = []
+            raw_data = None
+            endpoint_used = None
+
+            # Try multiple potential endpoints for violations
             endpoints_to_try = [
-                f"{monitor_url}/api/violations",
-                f"{monitor_url}/violations",
-                f"{monitor_url}/api/transactions",
-                f"{monitor_url}/transactions",
-                f"{monitor_url}/api/report"
+                f"http://localhost:{monitor_port}/api/wiretap/violations",
+                f"http://localhost:{monitor_port}/api/wiretap/transactions",
+                f"http://localhost:{monitor_port}/api/wiretap/requests",
             ]
 
-            last_error = None
             for endpoint in endpoints_to_try:
                 try:
-                    response = await client.get(endpoint)
-                    if response.status_code == 200:
-                        data = response.json()
-
-                        violations = []
-                        if isinstance(data, list):
-                            violations = data
-                        elif isinstance(data, dict):
-                            violations = data.get("violations", data.get("transactions", [data]))
-
-                        # Apply filters
-                        if filter_path:
-                            violations = [
-                                v for v in violations
-                                if isinstance(v, dict) and
-                                filter_path in str(v.get("path", v.get("url", "")))
-                            ]
-
-                        if violation_type and violation_type != "both":
-                            violations = [
-                                v for v in violations
-                                if isinstance(v, dict) and
-                                v.get("type", "").lower() == violation_type.lower()
-                            ]
-
-                        # Apply limit
-                        total = len(violations)
-                        violations = violations[:limit]
-
-                        return {
-                            "success": True,
-                            "endpoint_used": endpoint,
-                            "violations": violations,
-                            "count": len(violations),
-                            "total_available": total,
-                            "filter_path": filter_path,
-                            "violation_type": violation_type,
-                            "limit": limit
-                        }
-                except httpx.RequestError:
+                    resp = await client.get(endpoint)
+                    if resp.status_code == 200:
+                        raw_data = resp.json()
+                        endpoint_used = endpoint
+                        break
+                except Exception:
                     continue
 
+            if raw_data is None:
+                return {
+                    "success": False,
+                    "error": f"Could not connect to wiretap monitor at http://localhost:{monitor_port}",
+                    "suggestion": "Make sure wiretap is running with the monitor port accessible. Use start_wiretap first.",
+                    "endpoints_tried": endpoints_to_try
+                }
+
+            # Extract violations from raw data
+            if isinstance(raw_data, list):
+                all_items = raw_data
+            elif isinstance(raw_data, dict):
+                # Try common keys
+                all_items = (
+                    raw_data.get("violations") or
+                    raw_data.get("transactions") or
+                    raw_data.get("requests") or
+                    [raw_data]
+                )
+            else:
+                all_items = []
+
+            # Filter items
+            for item in all_items:
+                if not isinstance(item, dict):
+                    continue
+
+                # Apply path filter
+                item_path = item.get("path") or item.get("url") or item.get("requestPath") or ""
+                if filter_path and filter_path.lower() not in item_path.lower():
+                    continue
+
+                # Apply method filter
+                item_method = item.get("method") or item.get("httpMethod") or ""
+                if filter_method and item_method.upper() != filter_method.upper():
+                    continue
+
+                # Check if item has violations
+                has_violations = (
+                    item.get("violations") or
+                    item.get("requestViolations") or
+                    item.get("responseViolations") or
+                    item.get("hasViolations") or
+                    (item.get("type") == "violation")
+                )
+
+                if has_violations:
+                    violations.append(item)
+
+            # If no filtered violations found but we have raw data, return all
+            if not violations and all_items:
+                violations = all_items[:limit]
+
+            # Apply limit
+            violations = violations[:limit]
+
             return {
-                "success": False,
-                "error": f"Could not connect to wiretap monitor at {monitor_url}. Is wiretap running?",
-                "tried_endpoints": endpoints_to_try,
-                "hint": "Start wiretap first using start_wiretap tool, then use get_violations"
+                "success": True,
+                "monitor_port": monitor_port,
+                "endpoint_used": endpoint_used,
+                "total_violations": len(violations),
+                "filter_path": filter_path,
+                "filter_method": filter_method,
+                "limit": limit,
+                "violations": violations,
+                "raw_response_type": type(raw_data).__name__,
+                "message": f"Found {len(violations)} violation(s)" + (
+                    f" for path '{filter_path}'" if filter_path else ""
+                ) + (
+                    f" with method '{filter_method}'" if filter_method else ""
+                )
             }
-
-    except Exception as e:
-        return {"success": False, "error": str(e)}
-
-
-@mcp.tool()
-async def mock_api(
-    spec: str,
-    port: int = 9090,
-    static_dir: Optional[str] = None,
-    use_examples: bool = True
-) -> dict:
-    """Start wiretap in mock mode to generate and serve mock API responses directly from
-    an OpenAPI specification without needing a real backend."""
-    try:
-        args = ["mock", "-s", spec, "-p", str(port)]
-
-        if static_dir:
-            args.extend(["--static-dir", static_dir])
-        if not use_examples:
-            args.append("--no-examples")
-
-        cmd = _build_wiretap_command(args)
-
-        process = subprocess.Popen(
-            cmd,
-            stdout=subprocess.PIPE,
-            stderr=subprocess.PIPE,
-            text=True
-        )
-
-        _wiretap_processes[f"mock_{port}"] = process
-
-        import time
-        time.sleep(1)
-
-        if process.poll() is not None:
-            stdout, stderr = process.communicate()
-            return {
-                "success": False,
-                "error": f"Wiretap mock server failed to start. Exit code: {process.returncode}",
-                "stdout": stdout,
-                "stderr": stderr,
-                "command": " ".join(cmd)
-            }
-
-        return {
-            "success": True,
-            "message": "Wiretap mock server started successfully",
-            "pid": process.pid,
-            "mock_url": f"http://localhost:{port}",
-            "spec": spec,
-            "use_examples": use_examples,
-            "static_dir": static_dir,
-            "command": " ".join(cmd),
-            "note": f"Mock API is available at http://localhost:{port} — all endpoints from {spec} are being served as mocks"
-        }
-    except FileNotFoundError:
+    except httpx.ConnectError:
         return {
             "success": False,
-            "error": "Wiretap binary not found. Install with: npm install -g @pb33f/wiretap",
-            "install_options": [
-                "npm install -g @pb33f/wiretap",
-                "yarn global add @pb33f/wiretap",
-                "brew install pb33f/taps/wiretap"
-            ]
+            "error": f"Could not connect to wiretap monitor at http://localhost:{monitor_port}",
+            "suggestion": "Make sure wiretap is running. Use start_wiretap to start it."
         }
     except Exception as e:
-        return {"success": False, "error": str(e)}
+        return {
+            "success": False,
+            "error": str(e)
+        }
 
 
 @mcp.tool()
-async def inspect_spec(
-    spec: str,
-    filter_path: Optional[str] = None,
-    show_schemas: bool = False
+async def replay_traffic(
+    capture_file: str,
+    proxy_port: int = 9090,
+    delay_ms: int = 0,
+    filter_path: Optional[str] = None
 ) -> dict:
-    """Parse and inspect an OpenAPI specification file to list available paths, operations,
-    schemas, and any spec-level issues. Use this to understand what an API spec defines."""
+    """Replay previously captured HTTP traffic through the wiretap proxy for re-validation."""
     try:
-        # Load the spec - support both file path and URL
-        spec_data = None
+        import os
 
-        if spec.startswith("http://") or spec.startswith("https://"):
-            async with httpx.AsyncClient(timeout=15.0) as client:
-                response = await client.get(spec)
-                response.raise_for_status()
-                content = response.text
-                try:
-                    spec_data = json.loads(content)
-                except json.JSONDecodeError:
-                    spec_data = yaml.safe_load(content)
+        if not os.path.exists(capture_file):
+            return {
+                "success": False,
+                "error": f"Capture file not found: {capture_file}",
+                "capture_file": capture_file
+            }
+
+        # Read and parse the capture file
+        with open(capture_file, "r") as f:
+            content = f.read()
+
+        try:
+            capture_data = json.loads(content)
+        except json.JSONDecodeError:
+            return {
+                "success": False,
+                "error": f"Could not parse capture file as JSON: {capture_file}",
+                "suggestion": "Capture file must be in HAR or JSON format"
+            }
+
+        # Extract entries from HAR format or wiretap format
+        entries = []
+        if "log" in capture_data and "entries" in capture_data["log"]:
+            # HAR format
+            entries = capture_data["log"]["entries"]
+        elif "entries" in capture_data:
+            entries = capture_data["entries"]
+        elif isinstance(capture_data, list):
+            entries = capture_data
         else:
-            with open(spec, 'r') as f:
-                content = f.read()
+            entries = [capture_data]
+
+        results = []
+        replayed_count = 0
+        error_count = 0
+
+        async with httpx.AsyncClient(timeout=30.0) as client:
+            for entry in entries:
+                # Extract request details from HAR entry
+                request = entry.get("request", entry)
+
+                method = request.get("method", "GET").upper()
+                req_url = request.get("url", "")
+
+                # Try to extract path from URL
                 try:
-                    spec_data = json.loads(content)
-                except json.JSONDecodeError:
-                    spec_data = yaml.safe_load(content)
+                    parsed = httpx.URL(req_url)
+                    path = str(parsed.raw_path.decode()) if parsed.raw_path else "/"
+                    query = str(parsed.query.decode()) if parsed.query else ""
+                except Exception:
+                    path = req_url
+                    query = ""
 
-        if not spec_data:
-            return {"success": False, "error": "Failed to parse specification file"}
+                # Apply path filter
+                if filter_path and filter_path.lower() not in path.lower():
+                    continue
 
-        # Extract spec info
-        info = spec_data.get("info", {})
-        openapi_version = spec_data.get("openapi", spec_data.get("swagger", "unknown"))
-        servers = spec_data.get("servers", [])
-        paths = spec_data.get("paths", {})
-        components = spec_data.get("components", {})
-        schemas = components.get("schemas", spec_data.get("definitions", {}))
+                # Build proxy URL
+                proxy_url = f"http://localhost:{proxy_port}{path}"
+                if query:
+                    proxy_url = f"{proxy_url}?{query}"
 
-        # Build operations list
-        operations = []
-        http_methods = ["get", "post", "put", "patch", "delete", "head", "options", "trace"]
+                # Extract headers
+                headers = {}
+                for h in request.get("headers", []):
+                    name = h.get("name", "")
+                    value = h.get("value", "")
+                    # Skip hop-by-hop headers
+                    if name.lower() not in ["host", "connection", "transfer-encoding"]:
+                        headers[name] = value
 
-        for path, path_item in paths.items():
-            if filter_path and not path.startswith(filter_path):
-                continue
-            if not isinstance(path_item, dict):
-                continue
-            for method in http_methods:
-                if method in path_item:
-                    op = path_item[method]
-                    operation_entry = {
-                        "method": method.upper(),
-                        "path": path,
-                        "summary": op.get("summary", ""),
-                        "description": op.get("description", ""),
-                        "operationId": op.get("operationId", ""),
-                        "tags": op.get("tags", []),
-                        "parameters": len(op.get("parameters", [])),
-                        "request_body": bool(op.get("requestBody")),
-                        "responses": list(op.get("responses", {}).keys())
+                # Extract body
+                body = None
+                post_data = request.get("postData", {})
+                if post_data:
+                    body = post_data.get("text", None)
+
+                try:
+                    # Add delay if specified
+                    if delay_ms > 0:
+                        await asyncio.sleep(delay_ms / 1000.0)
+
+                    request_kwargs = {
+                        "method": method,
+                        "url": proxy_url,
+                        "headers": headers
                     }
-                    operations.append(operation_entry)
+                    if body:
+                        request_kwargs["content"] = body.encode("utf-8")
 
-        result = {
+                    response = await client.request(**request_kwargs)
+
+                    violation_headers = {
+                        k: v for k, v in response.headers.items()
+                        if "wiretap" in k.lower() or "violation" in k.lower()
+                    }
+
+                    results.append({
+                        "method": method,
+                        "path": path,
+                        "status_code": response.status_code,
+                        "has_violations": len(violation_headers) > 0,
+                        "violation_headers": violation_headers
+                    })
+                    replayed_count += 1
+
+                except Exception as req_err:
+                    results.append({
+                        "method": method,
+                        "path": path,
+                        "error": str(req_err)
+                    })
+                    error_count += 1
+
+        violations_found = sum(1 for r in results if r.get("has_violations", False))
+
+        return {
             "success": True,
-            "spec_file": spec,
-            "openapi_version": openapi_version,
-            "title": info.get("title", "Unknown"),
-            "version": info.get("version", "Unknown"),
-            "description": info.get("description", ""),
-            "servers": servers,
-            "total_paths": len(paths),
-            "total_operations": len(operations),
-            "operations": operations,
+            "capture_file": capture_file,
+            "proxy_port": proxy_port,
+            "total_entries": len(entries),
+            "replayed_count": replayed_count,
+            "error_count": error_count,
+            "violations_found": violations_found,
+            "delay_ms": delay_ms,
+            "filter_path": filter_path,
+            "results": results,
+            "message": f"Replayed {replayed_count} requests, found {violations_found} with violations"
+        }
+    except httpx.ConnectError:
+        return {
+            "success": False,
+            "error": f"Could not connect to wiretap proxy at http://localhost:{proxy_port}",
+            "suggestion": "Make sure wiretap is running. Use start_wiretap to start it.",
+            "capture_file": capture_file
+        }
+    except Exception as e:
+        return {
+            "success": False,
+            "error": str(e),
+            "capture_file": capture_file
         }
 
-        if filter_path:
-            result["filter_applied"] = filter_path
-
-        if show_schemas:
-            schema_summary = {}
-            for schema_name, schema_def in schemas.items():
-                if isinstance(schema_def, dict):
-                    schema_summary[schema_name] = {
-                        "type": schema_def.get("type", "object"),
-                        "properties": list(schema_def.get("properties", {}).keys()),
-                        "required": schema_def.get("required", []),
-                        "description": schema_def.get("description", "")
-                    }
-            result["schemas"] = schema_summary
-            result["total_schemas"] = len(schemas)
-
-        # Tag summary
-        all_tags = set()
-        for op in operations:
-            for tag in op.get("tags", []):
-                all_tags.add(tag)
-        result["tags"] = sorted(list(all_tags))
-
-        return result
-
-    except FileNotFoundError:
-        return {"success": False, "error": f"Specification file not found: {spec}"}
-    except yaml.YAMLError as e:
-        return {"success": False, "error": f"Failed to parse YAML/JSON spec: {str(e)}"}
-    except Exception as e:
-        return {"success": False, "error": str(e)}
 
 
 
-
-_SERVER_SLUG = mcp.name.lower().replace(" ", "-").replace("_", "-")
+_SERVER_SLUG = "wiretap"
 
 def _track(tool_name: str, ua: str = ""):
     try:
